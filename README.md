@@ -90,7 +90,7 @@ Follow these steps to run the project locally on your machine.
 
 ## 📸 Screenshots
 
-| Landing page | Sort Tool |
+| Dashboard | Sort Tool |
 |:---:|:---:|
 | ![Dashboard](screenshots/dashboard.png) | ![Sort](screenshots/sort_tool.png) |
 
