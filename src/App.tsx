@@ -64,18 +64,71 @@ const Button = ({ children, onClick, disabled, loading, variant = 'primary', cla
   );
 };
 
-const FileInput = ({ onChange, multiple = false, accept = ".pdf", label = "Seleccionar archivos" }: any) => (
-  <div className="w-full">
-    <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-indigo-100 border-dashed rounded-2xl cursor-pointer bg-indigo-50/30 hover:bg-indigo-50 hover:border-indigo-300 transition-colors">
-      <div className="flex flex-col items-center justify-center pt-5 pb-6">
-        <UploadCloud className="w-10 h-10 text-indigo-400 mb-2" />
-        <p className="mb-1 text-sm text-gray-500 font-medium">{label}</p>
-        <p className="text-xs text-gray-400">{multiple ? "Puedes seleccionar varios" : "Selecciona uno"}</p>
-      </div>
-      <input type="file" className="hidden" onChange={onChange} multiple={multiple} accept={accept} />
-    </label>
-  </div>
-);
+type FileInputProps = {
+  onFilesSelected: (files: File[]) => void;
+  multiple?: boolean;
+  accept?: string;
+  label?: string;
+};
+
+const FileInput = ({ onFilesSelected, multiple = false, accept = ".pdf", label = "Seleccionar archivos" }: FileInputProps) => {
+  const [isDragActive, setIsDragActive] = useState(false);
+
+  const emitFiles = (filesLike: FileList | File[]) => {
+    const pickedFiles = Array.from(filesLike);
+    if (!pickedFiles.length) return;
+    onFilesSelected(multiple ? pickedFiles : [pickedFiles[0]]);
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) emitFiles(e.target.files);
+    e.target.value = "";
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragActive(false);
+    emitFiles(e.dataTransfer.files);
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isDragActive) setIsDragActive(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setIsDragActive(false);
+  };
+
+  return (
+    <div className="w-full">
+      <label
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        className={`flex flex-col items-center justify-center w-full h-32 border-2 border-dashed rounded-2xl cursor-pointer transition-all ${
+          isDragActive
+            ? "border-indigo-400 bg-indigo-100 shadow-inner"
+            : "border-indigo-100 bg-indigo-50/30 hover:bg-indigo-50 hover:border-indigo-300"
+        }`}
+      >
+        <div className="flex flex-col items-center justify-center pt-5 pb-6">
+          <UploadCloud className={`w-10 h-10 mb-2 ${isDragActive ? "text-indigo-600" : "text-indigo-400"}`} />
+          <p className="mb-1 text-sm text-gray-500 font-medium">{label}</p>
+          <p className="text-xs text-gray-400">
+            {multiple ? "Selecciona varios o arrastralos aqui" : "Selecciona uno o arrastralo aqui"}
+          </p>
+        </div>
+        <input type="file" className="hidden" onChange={handleInputChange} multiple={multiple} accept={accept} />
+      </label>
+    </div>
+  );
+};
 
 // --- COMPONENTES DE HERRAMIENTAS ---
 
@@ -84,10 +137,8 @@ const MergeTool = ({ pdfLib, showToast }: any) => {
   const [files, setFiles] = useState<File[]>([]);
   const [processing, setProcessing] = useState(false);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setFiles(prev => [...prev, ...Array.from(e.target.files as FileList)]);
-    }
+  const handleFilesSelected = (selectedFiles: File[]) => {
+    setFiles(prev => [...prev, ...selectedFiles]);
   };
 
   const removeFile = (idx: number) => {
@@ -133,7 +184,7 @@ const MergeTool = ({ pdfLib, showToast }: any) => {
         <p className="text-gray-500 mt-2">Une múltiples documentos en un solo archivo ordenado.</p>
       </div>
 
-      <FileInput onChange={handleFileChange} multiple={true} label="Añadir archivos PDF" />
+      <FileInput onFilesSelected={handleFilesSelected} multiple={true} label="Añadir archivos PDF" />
 
       {files.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
@@ -176,6 +227,10 @@ const ExtractTool = ({ pdfLib, showToast }: any) => {
   const [file, setFile] = useState<File | null>(null);
   const [pagesStr, setPagesStr] = useState("");
   const [processing, setProcessing] = useState(false);
+
+  const handleFileSelected = (selectedFiles: File[]) => {
+    setFile(selectedFiles[0] ?? null);
+  };
 
   const extract = async () => {
     if (!file || !pagesStr) return showToast("Faltan datos", "error");
@@ -221,7 +276,7 @@ const ExtractTool = ({ pdfLib, showToast }: any) => {
         <p className="text-gray-500 mt-2">Crea un nuevo PDF con solo las páginas que necesitas.</p>
       </div>
 
-      <FileInput onChange={(e: any) => setFile(e.target.files[0])} label="Elige el PDF origen" />
+      <FileInput onFilesSelected={handleFileSelected} label="Elige el PDF origen" />
 
       {file && (
         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 space-y-4">
@@ -256,6 +311,10 @@ const UnlockTool = ({ pdfLib, showToast }: any) => {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [processing, setProcessing] = useState(false);
+
+  const handleFileSelected = (selectedFiles: File[]) => {
+    setFile(selectedFiles[0] ?? null);
+  };
 
   const unlock = async () => {
     if (!file || !password) return showToast("Por favor ingresa el archivo y la contraseña", "error");
@@ -295,7 +354,7 @@ const UnlockTool = ({ pdfLib, showToast }: any) => {
         <p className="text-gray-500 mt-2">Elimina la protección de contraseña de tus archivos.</p>
       </div>
 
-      {!file && <FileInput onChange={(e: any) => setFile(e.target.files[0])} label="Subir PDF Protegido" />}
+      {!file && <FileInput onFilesSelected={handleFileSelected} label="Subir PDF Protegido" />}
 
       {file && (
         <div className="space-y-4">
@@ -388,8 +447,8 @@ const SortTool = ({ pdfLib, pdfjs, showToast, openPreview }: any) => {
     setProcessing(false);
   };
 
-  const handleFile = (e: any) => {
-    const f = e.target.files[0];
+  const handleFileSelected = (selectedFiles: File[]) => {
+    const f = selectedFiles[0];
     if (f) {
       setFile(f);
       renderThumbnails(f);
@@ -445,7 +504,7 @@ const SortTool = ({ pdfLib, pdfjs, showToast, openPreview }: any) => {
         <p className="text-gray-500 mt-2">Arrastra y suelta para cambiar el orden. Clic para ampliar.</p>
       </div>
 
-      {!file && <FileInput onChange={handleFile} label="Cargar PDF para ordenar" />}
+      {!file && <FileInput onFilesSelected={handleFileSelected} label="Cargar PDF para ordenar" />}
 
       {file && thumbnails.length > 0 && (
         <div className="space-y-6">
@@ -495,10 +554,8 @@ const ImagesToPdfTool = ({ pdfLib, showToast, openPreview }: any) => {
   const [files, setFiles] = useState<File[]>([]); 
   const [processing, setProcessing] = useState(false);
 
-  const handleFiles = (e: any) => {
-    if (e.target.files) {
-      setFiles(prev => [...prev, ...Array.from(e.target.files as FileList)]);
-    }
+  const handleFilesSelected = (selectedFiles: File[]) => {
+    setFiles(prev => [...prev, ...selectedFiles]);
   };
 
   const removeFile = (idx: number) => {
@@ -556,7 +613,7 @@ const ImagesToPdfTool = ({ pdfLib, showToast, openPreview }: any) => {
         <p className="text-gray-500 mt-2">Convierte fotos o escaneos en un documento PDF único.</p>
       </div>
 
-      <FileInput onChange={handleFiles} multiple={true} accept="image/png, image/jpeg, image/jpg" label="Añadir Imágenes (JPG, PNG)" />
+      <FileInput onFilesSelected={handleFilesSelected} multiple={true} accept="image/png, image/jpeg, image/jpg" label="Añadir Imágenes (JPG, PNG)" />
 
       {files.length > 0 && (
         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
