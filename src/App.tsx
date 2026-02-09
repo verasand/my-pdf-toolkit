@@ -306,7 +306,7 @@ const ExtractTool = ({ pdfLib, showToast }: any) => {
 };
 
 // 3. ELIMINAR CONTRASEÑA (FIXED)
-const UnlockTool = ({ pdfLib, showToast }: any) => {
+const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
   const [file, setFile] = useState<File | null>(null);
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -316,35 +316,115 @@ const UnlockTool = ({ pdfLib, showToast }: any) => {
     setFile(selectedFiles[0] ?? null);
   };
 
+  const canvasToJpgBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> => {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(async (blob) => {
+        if (!blob) {
+          reject(new Error("No se pudo convertir la página a imagen"));
+          return;
+        }
+        resolve(new Uint8Array(await blob.arrayBuffer()));
+      }, "image/jpeg", 0.92);
+    });
+  };
+
+  const validateUnlockedPdf = async (candidateBytes: Uint8Array) => {
+    const validationTask = pdfjs.getDocument({ data: candidateBytes });
+    const validationPdf = await validationTask.promise;
+    try {
+      if (validationPdf.numPages > 0) {
+        await validationPdf.getPage(1);
+      }
+    } finally {
+      await validationPdf.destroy();
+    }
+  };
+
+  const rebuildUnlockedPdfFromRender = async (sourcePdf: any) => {
+    const rebuiltPdf = await pdfLib.PDFDocument.create();
+    const renderScale = 1.6;
+
+    for (let pageIndex = 1; pageIndex <= sourcePdf.numPages; pageIndex++) {
+      const page = await sourcePdf.getPage(pageIndex);
+      const outputViewport = page.getViewport({ scale: 1 });
+      const renderViewport = page.getViewport({ scale: renderScale });
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error("No se pudo crear el canvas para renderizar");
+
+      canvas.width = Math.max(1, Math.floor(renderViewport.width));
+      canvas.height = Math.max(1, Math.floor(renderViewport.height));
+      await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
+
+      const imgBytes = await canvasToJpgBytes(canvas);
+      const img = await rebuiltPdf.embedJpg(imgBytes);
+      const outPage = rebuiltPdf.addPage([outputViewport.width, outputViewport.height]);
+      outPage.drawImage(img, {
+        x: 0,
+        y: 0,
+        width: outputViewport.width,
+        height: outputViewport.height
+      });
+
+      canvas.width = 0;
+      canvas.height = 0;
+      if (typeof page.cleanup === "function") page.cleanup();
+    }
+
+    return rebuiltPdf.save();
+  };
+
   const unlock = async () => {
     if (!file || !password) return showToast("Por favor ingresa el archivo y la contraseña", "error");
     setProcessing(true);
-    try {
-      // 1. Lectura segura del buffer
-      const bytes = await file.arrayBuffer();
-      
-      // 2. Intento de carga con la contraseña proporcionada
-      // Nota: PDFLib maneja AES-128 nativamente. Si falla, suele ser contraseña incorrecta.
-      const pdfDoc = await pdfLib.PDFDocument.load(bytes, { 
-        password: password,
-        ignoreEncryption: false // Forzamos intento de desencriptado
-      });
+    let sourcePdf: any = null;
 
-      // 3. Guardado (al guardar sin especificar encrypt, se elimina la seguridad)
-      const pdfBytes = await pdfDoc.save();
-      
-      downloadBlob(pdfBytes, `desbloqueado_${file.name}`, "application/pdf");
-      showToast("¡Contraseña eliminada con éxito!", "success");
-      setPassword(""); // Limpiar contraseña por seguridad
+    try {
+      const sourceBytes = new Uint8Array(await file.arrayBuffer());
+
+      // Validar primero la contraseña con PDF.js.
+      const sourceTask = pdfjs.getDocument({ data: sourceBytes, password });
+      sourcePdf = await sourceTask.promise;
+
+      let unlockedBytes: Uint8Array | null = null;
+
+      try {
+        // Ruta rápida: intentar remover encriptación directamente.
+        const candidatePdf = await pdfLib.PDFDocument.load(sourceBytes, { ignoreEncryption: true });
+        const candidateBytes = await candidatePdf.save();
+        await validateUnlockedPdf(candidateBytes);
+        unlockedBytes = candidateBytes;
+      } catch (fastPathError) {
+        console.warn("Ruta directa de desbloqueo falló. Se usará reconstrucción por render.", fastPathError);
+      }
+
+      if (!unlockedBytes) {
+        // Fallback robusto: reconstruir página por página sin protección.
+        unlockedBytes = await rebuildUnlockedPdfFromRender(sourcePdf);
+      }
+
+      if (!unlockedBytes) {
+        throw new Error("No se pudo generar un PDF desbloqueado");
+      }
+
+      downloadBlob(unlockedBytes, `desbloqueado_${file.name}`, "application/pdf");
+      showToast("PDF desbloqueado correctamente", "success");
+      setPassword("");
     } catch (e: any) {
       console.error("Error detallado:", e);
-      if (e.message && e.message.includes('Password')) {
+      const msg = (e?.message || "").toLowerCase();
+      if (e?.name === "PasswordException" || msg.includes("password")) {
         showToast("Contraseña incorrecta. Inténtalo de nuevo.", "error");
       } else {
-        showToast("No se pudo desbloquear. ¿El archivo está dañado?", "error");
+        showToast("No se pudo desbloquear el PDF. Verifica el archivo e inténtalo de nuevo.", "error");
       }
+    } finally {
+      if (sourcePdf && typeof sourcePdf.destroy === "function") {
+        await sourcePdf.destroy();
+      }
+      setProcessing(false);
     }
-    setProcessing(false);
   };
 
   return (
@@ -869,3 +949,4 @@ function downloadBlob(data: Uint8Array, fileName: string, mimeType: string) {
   document.body.removeChild(link);
   URL.revokeObjectURL(link.href);
 }
+
