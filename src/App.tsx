@@ -311,20 +311,100 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [disableServiceUnlock, setDisableServiceUnlock] = useState(false);
+
+  const unlockServiceUrl = (import.meta.env.VITE_QPDF_UNLOCK_URL || "http://127.0.0.1:8787/unlock").trim();
+  const unlockServiceTimeoutMs = 4500;
 
   const handleFileSelected = (selectedFiles: File[]) => {
     setFile(selectedFiles[0] ?? null);
   };
 
-  const canvasToJpgBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> => {
+  const bytesToBase64 = (bytes: Uint8Array): string => {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
+  };
+
+  const base64ToBytes = (base64: string): Uint8Array => {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  };
+
+  const parseJsonSafe = async (response: Response) => {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  };
+
+  const tryUnlockViaService = async (sourceBytes: Uint8Array): Promise<Uint8Array | null> => {
+    if (disableServiceUnlock || !unlockServiceUrl) return null;
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), unlockServiceTimeoutMs);
+
+    try {
+      const response = await fetch(unlockServiceUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          pdfBase64: bytesToBase64(sourceBytes),
+          password,
+          fileName: file?.name ?? "document.pdf"
+        }),
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const serviceError = await parseJsonSafe(response);
+        console.warn("High-fidelity unlock service unavailable:", serviceError?.error || response.status);
+        if (response.status >= 500 || response.status === 404) {
+          setDisableServiceUnlock(true);
+        }
+        return null;
+      }
+
+      const payload = await parseJsonSafe(response);
+      if (!payload || typeof payload.pdfBase64 !== "string" || !payload.pdfBase64.length) {
+        console.warn("High-fidelity unlock service returned an invalid payload.");
+        return null;
+      }
+
+      return base64ToBytes(payload.pdfBase64);
+    } catch (serviceError: any) {
+      if (serviceError?.name === "AbortError" || serviceError instanceof TypeError) {
+        console.warn("High-fidelity unlock service is offline. Falling back to local unlock.");
+        setDisableServiceUnlock(true);
+        return null;
+      }
+      console.warn("High-fidelity unlock service error:", serviceError);
+      return null;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
+  const canvasToPngBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> => {
     return new Promise((resolve, reject) => {
       canvas.toBlob(async (blob) => {
         if (!blob) {
-          reject(new Error("No se pudo convertir la página a imagen"));
+          reject(new Error("No se pudo convertir la pagina a imagen"));
           return;
         }
         resolve(new Uint8Array(await blob.arrayBuffer()));
-      }, "image/jpeg", 0.92);
+      }, "image/png");
     });
   };
 
@@ -342,7 +422,7 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
 
   const rebuildUnlockedPdfFromRender = async (sourcePdf: any) => {
     const rebuiltPdf = await pdfLib.PDFDocument.create();
-    const renderScale = 1.6;
+    const renderScale = 2.0;
 
     for (let pageIndex = 1; pageIndex <= sourcePdf.numPages; pageIndex++) {
       const page = await sourcePdf.getPage(pageIndex);
@@ -357,8 +437,8 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
       canvas.height = Math.max(1, Math.floor(renderViewport.height));
       await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
 
-      const imgBytes = await canvasToJpgBytes(canvas);
-      const img = await rebuiltPdf.embedJpg(imgBytes);
+      const imgBytes = await canvasToPngBytes(canvas);
+      const img = await rebuiltPdf.embedPng(imgBytes);
       const outPage = rebuiltPdf.addPage([outputViewport.width, outputViewport.height]);
       outPage.drawImage(img, {
         x: 0,
@@ -376,48 +456,71 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
   };
 
   const unlock = async () => {
-    if (!file || !password) return showToast("Por favor ingresa el archivo y la contraseña", "error");
+    if (!file || !password) return showToast("Por favor ingresa el archivo y la contrasena", "error");
     setProcessing(true);
     let sourcePdf: any = null;
 
     try {
       const sourceBytes = new Uint8Array(await file.arrayBuffer());
 
-      // Validar primero la contraseña con PDF.js.
+      // Validate password first with PDF.js.
       const sourceTask = pdfjs.getDocument({ data: sourceBytes, password });
       sourcePdf = await sourceTask.promise;
 
       let unlockedBytes: Uint8Array | null = null;
+      let unlockPath: "qpdf-service" | "pdf-lib-direct" | "render-fallback" | null = null;
 
-      try {
-        // Ruta rápida: intentar remover encriptación directamente.
-        const candidatePdf = await pdfLib.PDFDocument.load(sourceBytes, { ignoreEncryption: true });
-        const candidateBytes = await candidatePdf.save();
-        await validateUnlockedPdf(candidateBytes);
-        unlockedBytes = candidateBytes;
-      } catch (fastPathError) {
-        console.warn("Ruta directa de desbloqueo falló. Se usará reconstrucción por render.", fastPathError);
+      const highFidelityBytes = await tryUnlockViaService(sourceBytes);
+      if (highFidelityBytes) {
+        try {
+          await validateUnlockedPdf(highFidelityBytes);
+          unlockedBytes = highFidelityBytes;
+          unlockPath = "qpdf-service";
+        } catch (serviceValidationError) {
+          console.warn("Service unlock produced an invalid PDF. Falling back to local unlock.", serviceValidationError);
+        }
       }
 
       if (!unlockedBytes) {
-        // Fallback robusto: reconstruir página por página sin protección.
+        try {
+          // Fast local path: remove encryption directly.
+          const candidatePdf = await pdfLib.PDFDocument.load(sourceBytes, { ignoreEncryption: true });
+          const candidateBytes = await candidatePdf.save();
+          await validateUnlockedPdf(candidateBytes);
+          unlockedBytes = candidateBytes;
+          unlockPath = "pdf-lib-direct";
+        } catch (fastPathError) {
+          console.warn("Direct local unlock failed. Using render fallback.", fastPathError);
+        }
+      }
+
+      if (!unlockedBytes) {
+        // Robust fallback: rebuild each page from render output.
         unlockedBytes = await rebuildUnlockedPdfFromRender(sourcePdf);
+        unlockPath = "render-fallback";
       }
 
       if (!unlockedBytes) {
         throw new Error("No se pudo generar un PDF desbloqueado");
       }
 
+      const successMessage =
+        unlockPath === "qpdf-service"
+          ? "PDF desbloqueado con alta fidelidad (qpdf)"
+          : unlockPath === "pdf-lib-direct"
+            ? "PDF desbloqueado correctamente"
+            : "PDF desbloqueado con fallback local";
+
       downloadBlob(unlockedBytes, `desbloqueado_${file.name}`, "application/pdf");
-      showToast("PDF desbloqueado correctamente", "success");
+      showToast(successMessage, "success");
       setPassword("");
     } catch (e: any) {
       console.error("Error detallado:", e);
       const msg = (e?.message || "").toLowerCase();
       if (e?.name === "PasswordException" || msg.includes("password")) {
-        showToast("Contraseña incorrecta. Inténtalo de nuevo.", "error");
+        showToast("Contrasena incorrecta. Intentalo de nuevo.", "error");
       } else {
-        showToast("No se pudo desbloquear el PDF. Verifica el archivo e inténtalo de nuevo.", "error");
+        showToast("No se pudo desbloquear el PDF. Verifica el archivo e intentalo de nuevo.", "error");
       }
     } finally {
       if (sourcePdf && typeof sourcePdf.destroy === "function") {
@@ -431,14 +534,14 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
     <div className="max-w-xl mx-auto space-y-6">
       <div className="text-center mb-8">
         <h2 className="text-3xl font-bold text-gray-800">Desbloquear PDF</h2>
-        <p className="text-gray-500 mt-2">Elimina la protección de contraseña de tus archivos.</p>
+        <p className="text-gray-500 mt-2">Elimina la proteccion de contrasena de tus archivos.</p>
       </div>
 
       {!file && <FileInput onFilesSelected={handleFileSelected} label="Subir PDF Protegido" />}
 
       {file && (
         <div className="space-y-4">
-          {/* Confirmación Visual del Archivo */}
+          {/* Confirmacion Visual del Archivo */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex items-center justify-between">
             <div className="flex items-center gap-3 overflow-hidden">
                <div className="p-2 bg-rose-50 text-rose-600 rounded-lg">
@@ -454,14 +557,14 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
             </button>
           </div>
 
-          {/* Input de Contraseña */}
+          {/* Input de Contrasena */}
           <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-            <label className="block text-sm font-medium text-gray-700 mb-2">Contraseña del documento</label>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Contrasena del documento</label>
             <div className="relative">
               <Unlock className="absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
               <input 
                 type={showPassword ? "text" : "password"} 
-                placeholder="Ingresa la contraseña para desbloquear"
+                placeholder="Ingresa la contrasena para desbloquear"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full pl-12 pr-12 py-3.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-rose-500 focus:border-rose-500 outline-none transition-all"
@@ -475,14 +578,15 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
               </button>
             </div>
             <p className="text-xs text-gray-400 mt-2 flex items-center gap-1">
-              <CheckCircle className="w-3 h-3 text-green-500" /> Soporta encriptación estándar AES 128/256-bit
+              <CheckCircle className="w-3 h-3 text-green-500" /> Intenta desbloqueo alta fidelidad con qpdf y usa fallback local automatico.
             </p>
+            <p className="text-xs text-gray-400 mt-1 break-all">Endpoint qpdf: {unlockServiceUrl}</p>
           </div>
         </div>
       )}
 
       <Button onClick={unlock} loading={processing} disabled={!file || !password} variant="primary" className="w-full py-4 text-lg bg-rose-600 hover:bg-rose-700 shadow-rose-200">
-        {processing ? "Desbloqueando..." : "Eliminar Restricción"}
+        {processing ? "Desbloqueando..." : "Eliminar Restriccion"}
       </Button>
     </div>
   );
@@ -949,4 +1053,5 @@ function downloadBlob(data: Uint8Array, fileName: string, mimeType: string) {
   document.body.removeChild(link);
   URL.revokeObjectURL(link.href);
 }
+
 
