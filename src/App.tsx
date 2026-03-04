@@ -316,59 +316,98 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
     setFile(selectedFiles[0] ?? null);
   };
 
-  const canvasToJpgBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> =>
-    new Promise((resolve, reject) => {
+  const canvasToJpgBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> => {
+    return new Promise((resolve, reject) => {
       canvas.toBlob(async (blob) => {
         if (!blob) {
-          reject(new Error("No se pudo convertir la pagina a imagen"));
+          reject(new Error("No se pudo convertir la página a imagen"));
           return;
         }
         resolve(new Uint8Array(await blob.arrayBuffer()));
       }, "image/jpeg", 0.92);
     });
+  };
+
+  const validateUnlockedPdf = async (candidateBytes: Uint8Array) => {
+    const validationTask = pdfjs.getDocument({ data: candidateBytes });
+    const validationPdf = await validationTask.promise;
+    try {
+      if (validationPdf.numPages > 0) {
+        await validationPdf.getPage(1);
+      }
+    } finally {
+      await validationPdf.destroy();
+    }
+  };
+
+  const rebuildUnlockedPdfFromRender = async (sourcePdf: any) => {
+    const rebuiltPdf = await pdfLib.PDFDocument.create();
+    const renderScale = 1.6;
+
+    for (let pageIndex = 1; pageIndex <= sourcePdf.numPages; pageIndex++) {
+      const page = await sourcePdf.getPage(pageIndex);
+      const outputViewport = page.getViewport({ scale: 1 });
+      const renderViewport = page.getViewport({ scale: renderScale });
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error("No se pudo crear el canvas para renderizar");
+
+      canvas.width = Math.max(1, Math.floor(renderViewport.width));
+      canvas.height = Math.max(1, Math.floor(renderViewport.height));
+      await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
+
+      const imgBytes = await canvasToJpgBytes(canvas);
+      const img = await rebuiltPdf.embedJpg(imgBytes);
+      const outPage = rebuiltPdf.addPage([outputViewport.width, outputViewport.height]);
+      outPage.drawImage(img, {
+        x: 0,
+        y: 0,
+        width: outputViewport.width,
+        height: outputViewport.height
+      });
+
+      canvas.width = 0;
+      canvas.height = 0;
+      if (typeof page.cleanup === "function") page.cleanup();
+    }
+
+    return rebuiltPdf.save();
+  };
 
   const unlock = async () => {
-    if (!file || !password) return showToast("Por favor ingresa el archivo y la contrasena", "error");
+    if (!file || !password) return showToast("Por favor ingresa el archivo y la contraseña", "error");
     setProcessing(true);
     let sourcePdf: any = null;
 
     try {
       const sourceBytes = new Uint8Array(await file.arrayBuffer());
-      const loadingTask = pdfjs.getDocument({ data: sourceBytes, password });
-      sourcePdf = await loadingTask.promise;
 
-      const newPdf = await pdfLib.PDFDocument.create();
-      const renderScale = 1.8;
+      // Validar primero la contraseña con PDF.js.
+      const sourceTask = pdfjs.getDocument({ data: sourceBytes, password });
+      sourcePdf = await sourceTask.promise;
 
-      for (let pageIndex = 1; pageIndex <= sourcePdf.numPages; pageIndex++) {
-        const srcPage = await sourcePdf.getPage(pageIndex);
-        const outputViewport = srcPage.getViewport({ scale: 1 });
-        const renderViewport = srcPage.getViewport({ scale: renderScale });
+      let unlockedBytes: Uint8Array | null = null;
 
-        const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("No se pudo crear el canvas para renderizar");
-
-        canvas.width = Math.max(1, Math.floor(renderViewport.width));
-        canvas.height = Math.max(1, Math.floor(renderViewport.height));
-        await srcPage.render({ canvasContext: ctx, viewport: renderViewport }).promise;
-
-        const imgBytes = await canvasToJpgBytes(canvas);
-        const img = await newPdf.embedJpg(imgBytes);
-        const outPage = newPdf.addPage([outputViewport.width, outputViewport.height]);
-        outPage.drawImage(img, {
-          x: 0,
-          y: 0,
-          width: outputViewport.width,
-          height: outputViewport.height
-        });
-
-        canvas.width = 0;
-        canvas.height = 0;
-        if (typeof srcPage.cleanup === "function") srcPage.cleanup();
+      try {
+        // Ruta rápida: intentar remover encriptación directamente.
+        const candidatePdf = await pdfLib.PDFDocument.load(sourceBytes, { ignoreEncryption: true });
+        const candidateBytes = await candidatePdf.save();
+        await validateUnlockedPdf(candidateBytes);
+        unlockedBytes = candidateBytes;
+      } catch (fastPathError) {
+        console.warn("Ruta directa de desbloqueo falló. Se usará reconstrucción por render.", fastPathError);
       }
 
-      const unlockedBytes = await newPdf.save();
+      if (!unlockedBytes) {
+        // Fallback robusto: reconstruir página por página sin protección.
+        unlockedBytes = await rebuildUnlockedPdfFromRender(sourcePdf);
+      }
+
+      if (!unlockedBytes) {
+        throw new Error("No se pudo generar un PDF desbloqueado");
+      }
+
       downloadBlob(unlockedBytes, `desbloqueado_${file.name}`, "application/pdf");
       showToast("PDF desbloqueado correctamente", "success");
       setPassword("");
@@ -376,9 +415,9 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
       console.error("Error detallado:", e);
       const msg = (e?.message || "").toLowerCase();
       if (e?.name === "PasswordException" || msg.includes("password")) {
-        showToast("Contrasena incorrecta. Intentalo de nuevo.", "error");
+        showToast("Contraseña incorrecta. Inténtalo de nuevo.", "error");
       } else {
-        showToast("No se pudo desbloquear el PDF. Verifica el archivo e intentalo de nuevo.", "error");
+        showToast("No se pudo desbloquear el PDF. Verifica el archivo e inténtalo de nuevo.", "error");
       }
     } finally {
       if (sourcePdf && typeof sourcePdf.destroy === "function") {
@@ -392,14 +431,14 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
     <div className="max-w-xl mx-auto space-y-6">
       <div className="text-center mb-8">
         <h2 className="text-3xl font-bold text-gray-800">Desbloquear PDF</h2>
-        <p className="text-gray-500 mt-2">Elimina la proteccion de contrasena de tus archivos.</p>
+        <p className="text-gray-500 mt-2">Elimina la protección de contraseña de tus archivos.</p>
       </div>
 
       {!file && <FileInput onFilesSelected={handleFileSelected} label="Subir PDF Protegido" />}
 
       {file && (
         <div className="space-y-4">
-          {/* Confirmacion Visual del Archivo */}
+          {/* Confirmación Visual del Archivo */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex items-center justify-between">
             <div className="flex items-center gap-3 overflow-hidden">
                <div className="p-2 bg-rose-50 text-rose-600 rounded-lg">
@@ -415,14 +454,14 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
             </button>
           </div>
 
-          {/* Input de Contrasena */}
+          {/* Input de Contraseña */}
           <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-            <label className="block text-sm font-medium text-gray-700 mb-2">Contrasena del documento</label>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Contraseña del documento</label>
             <div className="relative">
               <Unlock className="absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
               <input 
                 type={showPassword ? "text" : "password"} 
-                placeholder="Ingresa la contrasena para desbloquear"
+                placeholder="Ingresa la contraseña para desbloquear"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full pl-12 pr-12 py-3.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-rose-500 focus:border-rose-500 outline-none transition-all"
@@ -436,14 +475,14 @@ const UnlockTool = ({ pdfLib, pdfjs, showToast }: any) => {
               </button>
             </div>
             <p className="text-xs text-gray-400 mt-2 flex items-center gap-1">
-              <CheckCircle className="w-3 h-3 text-green-500" /> Soporta encriptacion estandar AES 128/256-bit
+              <CheckCircle className="w-3 h-3 text-green-500" /> Soporta encriptación estándar AES 128/256-bit
             </p>
           </div>
         </div>
       )}
 
       <Button onClick={unlock} loading={processing} disabled={!file || !password} variant="primary" className="w-full py-4 text-lg bg-rose-600 hover:bg-rose-700 shadow-rose-200">
-        {processing ? "Desbloqueando..." : "Eliminar Restriccion"}
+        {processing ? "Desbloqueando..." : "Eliminar Restricción"}
       </Button>
     </div>
   );
@@ -910,3 +949,4 @@ function downloadBlob(data: Uint8Array, fileName: string, mimeType: string) {
   document.body.removeChild(link);
   URL.revokeObjectURL(link.href);
 }
+
